@@ -8,3 +8,10 @@ __pycache__/
 # Pasta de ambiente virtual (se você usar)
 venv/
 .venv/
+
+# Bancos SQLite gerados em runtime
+*.db
+
+# Logs e arquivos gerados automaticamente
+log_downloads.txt
+PyWhatKit_DB.txt

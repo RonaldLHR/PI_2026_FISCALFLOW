@@ -2,6 +2,7 @@ import email
 import imaplib
 import smtplib
 import os
+import sqlite3
 import time
 import zipfile
 import io
@@ -16,6 +17,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.image import MIMEImage
 from email.header import decode_header, make_header
 from dotenv import load_dotenv  # <--- NOVO: Biblioteca para ler o .env
+import xml.etree.ElementTree as ET
 
 # Tenta importar a biblioteca para .rar, se não existir, o suporte será desativado
 try:
@@ -37,7 +39,7 @@ class EmailBot:
     def __init__(self, config: dict):
         self.config = config
         self.filters = config.get("FILTERS", {})
-        self.log_file = self.config["ARQUIVO_LOG"]
+        self.db_path = self.config.get("ARQUIVO_LOG", "historico_downloads.db")
         self.base_download_path = self.config["PASTA_DOWNLOAD"]
 
         # Verifica se o caminho de download foi carregado do .env
@@ -45,9 +47,27 @@ class EmailBot:
             raise ValueError("ERRO: O caminho de download (DOWNLOAD_PATH) não foi encontrado no arquivo .env.")
 
         os.makedirs(self.base_download_path, exist_ok=True)
-        if not os.path.exists(self.log_file):
-            with open(self.log_file, 'w', encoding='utf-8') as f:
-                pass
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+        self._init_database()
+
+    def _get_db_connection(self):
+        return sqlite3.connect(self.db_path)
+
+    def _init_database(self):
+        with self._get_db_connection() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS logs_xml (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    log_key TEXT UNIQUE NOT NULL,
+                    filename TEXT NOT NULL,
+                    data_download TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
 
     def _build_search_criteria(self) -> str:
         criteria = ["UNANSWERED"]
@@ -60,15 +80,24 @@ class EmailBot:
         return " ".join(criteria)
 
     def _is_file_in_log(self, file_identifier: str) -> bool:
-        try:
-            with open(self.log_file, 'r', encoding='utf-8') as f:
-                return file_identifier in {line.strip() for line in f}
-        except FileNotFoundError:
-            return False
+        with self._get_db_connection() as conn:
+            cursor = conn.execute(
+                "SELECT 1 FROM logs_xml WHERE log_key = ? LIMIT 1",
+                (file_identifier,)
+            )
+            return cursor.fetchone() is not None
 
-    def _log_downloaded_file(self, file_identifier: str):
-        with open(self.log_file, 'a', encoding='utf-8') as f:
-            f.write(file_identifier + '\n')
+    def _log_downloaded_file(self, file_identifier: str, filename: str):
+        data_download = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._get_db_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO logs_xml (log_key, filename, data_download)
+                VALUES (?, ?, ?)
+                """,
+                (file_identifier, filename, data_download)
+            )
+            conn.commit()
 
     def _sanitize_foldername(self, name: str) -> str:
         name = re.sub(r'[\x00-\x1f\r\n]', '', name).strip()
@@ -197,6 +226,16 @@ class EmailBot:
         except Exception: pass
         return None
 
+    def _is_valid_xml(self, content: bytes) -> bool:
+        if not content:
+            return False
+        try:
+            # xml.etree accepts bytes or str; this will validate well-formedness
+            ET.fromstring(content)
+            return True
+        except Exception:
+            return False
+
     def _process_links_in_email_body(self, email_message: Message) -> list[dict]:
         all_xmls_from_links = []
         url_pattern = re.compile(r'https?://[^\s<>"]+')
@@ -303,14 +342,25 @@ class EmailBot:
             is_tar = filename_lower.endswith(('.tar', '.gz', '.bz2', '.tgz'))
             
             if is_xml:
-                print(f"--> [XML DIRETO] Anexo qualificado: '{filename}'")
-                xml_attachments.append({"filename": filename, "content": part.get_payload(decode=True), "log_key": filename})
+                content = part.get_payload(decode=True)
+                if content and self._is_valid_xml(content):
+                    print(f"--> [XML DIRETO] Anexo qualificado: '{filename}'")
+                    xml_attachments.append({"filename": filename, "content": content, "log_key": filename})
+                else:
+                    print(f"--> [IGNORADO] Anexo '{filename}' não é um XML válido ou está vazio.")
             elif is_zip or is_rar or is_tar:
                 print(f"--> [ARQUIVO COMPACTADO] Anexo qualificado: '{filename}'")
                 archive_type = 'zip' if is_zip else 'rar' if is_rar else 'tar'
                 archive_data = io.BytesIO(part.get_payload(decode=True))
                 xmls_in_archive = self._extract_xml_from_archive_recursively(archive_data, parent_log_key=filename, archive_type=archive_type)
-                xml_attachments.extend(xmls_in_archive)
+                # Filtra apenas XMLs bem-formados extraídos do arquivo compactado
+                valid_xmls = []
+                for x in xmls_in_archive:
+                    if x.get("content") and self._is_valid_xml(x.get("content")):
+                        valid_xmls.append(x)
+                    else:
+                        print(f"--> [IGNORADO] Arquivo extraído '{x.get('filename')}' não é um XML válido.")
+                xml_attachments.extend(valid_xmls)
             else:
                 print(f"--> [IGNORADO] Anexo '{filename}' não é um formato suportado.")
         return xml_attachments
@@ -328,13 +378,20 @@ class EmailBot:
                 continue
             if os.path.exists(final_xml_path):
                 print(f"--> [DUPLICADO NO DISCO] Arquivo '{safe_filename}' já existe. Adicionando ao log.")
-                self._log_downloaded_file(log_key)
+                self._log_downloaded_file(log_key, safe_filename)
                 continue
 
-            any_new_downloads = True
+            # Verifica se o conteúdo é um XML bem-formado antes de salvar
+            content = xml_item.get("content")
+            if not content or not self._is_valid_xml(content):
+                print(f"--> [IGNORADO] Conteúdo de '{safe_filename}' não é um XML válido. Não será salvo.")
+                continue
+
             try:
-                with open(final_xml_path, 'wb') as f: f.write(xml_item["content"])
-                self._log_downloaded_file(log_key)
+                with open(final_xml_path, 'wb') as f:
+                    f.write(content)
+                self._log_downloaded_file(log_key, safe_filename)
+                any_new_downloads = True
                 print(f"--> [SALVO] '{safe_filename}' salvo em: {folder_path}")
             except OSError as e:
                 print(f"--> [ERRO AO SALVAR] Não foi possível salvar '{safe_filename}': {e}")
@@ -348,7 +405,20 @@ class EmailBot:
         
         email_message = email.message_from_bytes(msg_data[0][1])
         email_subject = str(make_header(decode_header(email_message["subject"])))
-        print(f"\n--- Analisando e-mail de: {email_message['from']} | Assunto: '{email_subject}' ---")
+        # Segurança: ignorar e-mails internos da própria empresa
+        from_header = (email_message.get('From') or '')
+        from_header_lower = from_header.lower()
+        print(f"\n--- Analisando e-mail de: {from_header} | Assunto: '{email_subject}' ---")
+
+        # Caso o e-mail venha do domínio interno, marcar como lido e pular processamento
+        internal_domain = '@rpscontabil.com.br'
+        if internal_domain in from_header_lower:
+            print(f"--> [IGNORADO - INTERNO] E-mail vindo do domínio interno '{internal_domain}' detectado em '{from_header}'. Ignorando e marcando como lido.")
+            try:
+                mail.store(email_id, '+FLAGS', '\\Seen')
+            except Exception as e:
+                print(f"--> [AVISO] Falha ao marcar e-mail como lido: {e}")
+            return
 
         xml_from_attachments = self._find_xml_attachments(email_message)
         xml_from_links = self._process_links_in_email_body(email_message)
@@ -364,9 +434,13 @@ class EmailBot:
         
         if found_new_files:
             self._send_reply(email_message)
-        
-        mail.store(email_id, '+FLAGS', '\\Seen \\Answered')
-        print(f"--> [INFO] E-mail ID {email_id.decode()} processado e marcado como Lido e Respondido.")
+            mail.store(email_id, '+FLAGS', '\\Seen \\Answered')
+            print(f"--> [INFO] E-mail ID {email_id.decode()} processado e marcado como Lido e Respondido.")
+        else:
+            # Não responder se nenhum novo XML foi salvo; apenas marcar como lido
+            print("--> [INFO] Nenhum XML novo foi salvo. Não será enviada resposta.")
+            mail.store(email_id, '+FLAGS', '\\Seen')
+            print(f"--> [INFO] E-mail ID {email_id.decode()} marcado apenas como Lido.")
 
     def run_cycle(self):
         print(f"\n--- [CICLO INICIADO] {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} ---")
@@ -433,7 +507,7 @@ def main():
         "IMAP_SERVIDOR": "imap.gmail.com",
         "SMTP_SERVIDOR": "smtp.gmail.com",
         "SMTP_PORTA": 587,
-        "ARQUIVO_LOG": "log_downloads.txt",
+        "ARQUIVO_LOG": "historico_downloads.db",
         "INTERVALO_SEGUNDOS": 60,
         "FILTERS": {"UNSEEN": False, "SINCE_DAYS_AGO": 3},
         "ENABLE_WHATSAPP_NOTIFICATION": True,
